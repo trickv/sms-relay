@@ -34,7 +34,8 @@ import time
 import re
 import base64
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional, List, Set
 
 from dotenv import load_dotenv
@@ -107,7 +108,21 @@ class SMSMastodonRelay:
                 flow = InstalledAppFlow.from_client_secrets_file(
                     str(creds_path), SCOPES
                 )
-                creds = flow.run_local_server(port=0)
+                # Use console-based auth for headless environments
+                flow.redirect_uri = 'urn:ietf:wg:oauth:2.0:oob'
+                auth_url, _ = flow.authorization_url(prompt='consent')
+
+                print("\n" + "="*60)
+                print("AUTHORIZATION REQUIRED")
+                print("="*60)
+                print("\n1. Open this URL in your browser:\n")
+                print(auth_url)
+                print("\n2. Authorize the application")
+                print("3. Copy the authorization code\n")
+
+                code = input("Enter the authorization code: ").strip()
+                flow.fetch_token(code=code)
+                creds = flow.credentials
 
             # Save credentials for next run
             with open(token_path, 'w') as token:
@@ -146,12 +161,24 @@ class SMSMastodonRelay:
     def extract_phone_number(self, from_header: str) -> Optional[str]:
         """Extract phone number from email From header.
 
-        Example: '"7152009057" <7152009057.12345678@txt.voice.google.com>'
+        Example: '"(715) 200-9057" <18157149105.17152009057.Qr389lvDT4@txt.voice.google.com>'
         Returns: '7152009057'
         """
-        match = re.search(r'["\']?(\d{10})["\']?\s*<', from_header)
-        if match:
-            return match.group(1)
+        # Try to extract from the quoted display name (remove all non-digits)
+        quoted_match = re.search(r'["\']([^"\']+)["\']', from_header)
+        if quoted_match:
+            digits = re.sub(r'\D', '', quoted_match.group(1))
+            # Handle 11-digit numbers starting with 1 (strip the leading 1)
+            if len(digits) == 11 and digits.startswith('1'):
+                return digits[1:]
+            elif len(digits) == 10:
+                return digits
+
+        # Fall back to extracting from email address
+        email_match = re.search(r'\.(\d{10})\.\w+@', from_header)
+        if email_match:
+            return email_match.group(1)
+
         return None
 
     def decode_message_body(self, payload: dict) -> Optional[str]:
@@ -171,12 +198,12 @@ class SMSMastodonRelay:
     def get_new_sms_messages(self) -> List[dict]:
         """Fetch new SMS messages from Gmail."""
         try:
-            # Search for messages from Google Voice
-            query = 'from:txt.voice.google.com is:unread'
+            # Search for messages from Google Voice in the last week, filter by phone in code
+            query = 'from:txt.voice.google.com newer_than:7d'
             results = self.gmail_service.users().messages().list(
                 userId='me',
                 q=query,
-                maxResults=10
+                maxResults=50
             ).execute()
 
             messages = results.get('messages', [])
@@ -207,16 +234,6 @@ class SMSMastodonRelay:
             print(f"ERROR fetching Gmail messages: {error}")
             return []
 
-    def mark_as_read(self, message_id: str):
-        """Mark a Gmail message as read."""
-        try:
-            self.gmail_service.users().messages().modify(
-                userId='me',
-                id=message_id,
-                body={'removeLabelIds': ['UNREAD']}
-            ).execute()
-        except HttpError as error:
-            print(f"WARNING: Could not mark message as read: {error}")
 
     def process_message(self, message: dict) -> bool:
         """Process a single Gmail message and post to Mastodon if valid.
@@ -231,10 +248,13 @@ class SMSMastodonRelay:
         from_header = headers.get('From', '')
         phone_number = self.extract_phone_number(from_header)
 
+        # Debug: print the from header if we can't extract phone number
+        if not phone_number:
+            print(f"DEBUG: Could not extract phone from: {from_header}")
+
         # Filter by source phone number
         if phone_number != self.source_phone:
             print(f"Skipping message from {phone_number} (not {self.source_phone})")
-            self.mark_as_read(msg_id)
             self.save_processed_message(msg_id)
             return False
 
@@ -242,31 +262,64 @@ class SMSMastodonRelay:
         body = self.decode_message_body(payload)
         if not body:
             print(f"WARNING: Could not decode message body for {msg_id}")
-            self.mark_as_read(msg_id)
             self.save_processed_message(msg_id)
             return False
 
         # Clean up message body
         body = body.strip()
 
+        # Remove Google Voice header link
+        body = re.sub(r'^<https://voice\.google\.com>\s*', '', body)
+
+        # Remove footer starting with "Rply STOP" or "Reply STOP"
+        footer_patterns = [
+            r'Rply STOP',
+            r'Reply STOP',
+            r'To respond to this text message',
+        ]
+        for pattern in footer_patterns:
+            match = re.search(pattern, body, re.IGNORECASE)
+            if match:
+                body = body[:match.start()].strip()
+                break
+
+        # Final cleanup
+        body = body.strip()
+
         # Ignore genesis message
         if body == GENESIS_MESSAGE:
             print(f"Skipping genesis message from {phone_number}")
-            self.mark_as_read(msg_id)
             self.save_processed_message(msg_id)
             return False
 
         # Post to Mastodon
         try:
-            subject = headers.get('Subject', '')
+            # Check if message is more than 1 hour old
             date_str = headers.get('Date', '')
+            prepend_timestamp = False
+            if date_str:
+                try:
+                    msg_time = parsedate_to_datetime(date_str)
+                    now = datetime.now(timezone.utc)
+                    age_hours = (now - msg_time).total_seconds() / 3600
+                    if age_hours > 1:
+                        prepend_timestamp = True
+                        # Format timestamp for display
+                        timestamp_str = msg_time.strftime('%b %-d, %Y %-I:%M %p')
+                        body = f"📱 {timestamp_str}\n\n{body}"
+                except Exception as e:
+                    print(f"DEBUG: Could not parse date '{date_str}': {e}")
 
             print(f"\n{'='*60}")
-            print(f"New SMS from {phone_number}")
-            print(f"Date: {date_str}")
-            print(f"Subject: {subject}")
-            print(f"Body: {body[:100]}...")
+            print(body)
             print(f"{'='*60}")
+
+            # Ask for confirmation before posting
+            response = input("\nPost this message to Mastodon? [y/N]: ").strip().lower()
+            if response != 'y' and response != 'yes':
+                print("Skipped posting to Mastodon")
+                self.save_processed_message(msg_id)
+                return False
 
             # Post to Mastodon
             status = self.mastodon_client.status_post(body)
@@ -274,7 +327,6 @@ class SMSMastodonRelay:
             print(f"✓ Posted to Mastodon: {status['url']}")
 
             # Mark as processed
-            self.mark_as_read(msg_id)
             self.save_processed_message(msg_id)
 
             return True
@@ -313,6 +365,7 @@ class SMSMastodonRelay:
                 else:
                     print("No new messages")
 
+                print(f"Sleeping for {self.poll_interval}s...\n")
                 time.sleep(self.poll_interval)
 
         except KeyboardInterrupt:
