@@ -110,6 +110,13 @@ class SMSMastodonRelay:
                     print("ERROR: credentials.json not found!")
                     print("Download OAuth 2.0 credentials from Google Cloud Console")
                     sys.exit(1)
+
+                # Check if running headless
+                if not sys.stdin.isatty():
+                    print("ERROR: OAuth authentication required but running in headless mode.")
+                    print("Run the script interactively first to complete OAuth flow.")
+                    sys.exit(1)
+
                 print("Starting OAuth flow for Gmail...")
                 flow = InstalledAppFlow.from_client_secrets_file(
                     str(creds_path), SCOPES
@@ -328,13 +335,18 @@ class SMSMastodonRelay:
 
             if auto_post:
                 print("\n🚢 Auto-posting (contains 'ferry')")
-            else:
-                # Ask for confirmation before posting
+            elif sys.stdin.isatty():
+                # Ask for confirmation before posting (only if running interactively)
                 response = input("\nPost this message to Mastodon? [y/N]: ").strip().lower()
                 if response != 'y' and response != 'yes':
                     print("Skipped posting to Mastodon")
                     self.save_processed_message(msg_id)
                     return False
+            else:
+                # Running headless - skip non-auto-post messages
+                print("Skipping (headless mode, no auto-post trigger)")
+                self.save_processed_message(msg_id)
+                return False
 
             # Post to Mastodon
             status = self.mastodon_client.status_post(body)
