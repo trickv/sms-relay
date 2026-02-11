@@ -98,8 +98,14 @@ class SMSMastodonRelay:
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 print("Refreshing Gmail credentials...")
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                except Exception as e:
+                    print(f"Token refresh failed: {e}")
+                    print("Token may be expired or revoked. Re-authenticating...")
+                    creds = None
+                    token_path.unlink(missing_ok=True)
+            if not creds:
                 if not creds_path.exists():
                     print("ERROR: credentials.json not found!")
                     print("Download OAuth 2.0 credentials from Google Cloud Console")
@@ -228,6 +234,9 @@ class SMSMastodonRelay:
 
                 full_messages.append(full_msg)
 
+            # Sort messages by date (oldest first) for chronological posting
+            full_messages.sort(key=lambda msg: msg['internalDate'])
+
             return full_messages
 
         except HttpError as error:
@@ -314,12 +323,18 @@ class SMSMastodonRelay:
             print(body)
             print(f"{'='*60}")
 
-            # Ask for confirmation before posting
-            response = input("\nPost this message to Mastodon? [y/N]: ").strip().lower()
-            if response != 'y' and response != 'yes':
-                print("Skipped posting to Mastodon")
-                self.save_processed_message(msg_id)
-                return False
+            # Check if message contains "ferry" (case-insensitive) for auto-posting
+            auto_post = 'ferry' in body.lower()
+
+            if auto_post:
+                print("\n🚢 Auto-posting (contains 'ferry')")
+            else:
+                # Ask for confirmation before posting
+                response = input("\nPost this message to Mastodon? [y/N]: ").strip().lower()
+                if response != 'y' and response != 'yes':
+                    print("Skipped posting to Mastodon")
+                    self.save_processed_message(msg_id)
+                    return False
 
             # Post to Mastodon
             status = self.mastodon_client.status_post(body)
